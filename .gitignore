@@ -1,0 +1,21 @@
+#Environment variables
+.env
+
+#Build files
+build/
+
+#Config files
+config.json
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+#Logs
+logs/
