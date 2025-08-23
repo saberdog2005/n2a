@@ -1,10 +1,10 @@
-#Environment variables
+# Environment variables
 .env
 
-#Build files
+# Build files
 build/
 
-#Config files
+# Config files
 config.json
 
 # Go specific
@@ -17,5 +17,8 @@ config.json
 *.out
 go.work
 
-#Logs
+# Logs
 logs/
+
+# Mac
+.DS_Store
