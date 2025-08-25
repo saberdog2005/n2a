@@ -20,6 +20,87 @@ import (
 	"github.com/sashabaranov/go-openai"
 )
 
+// Application constants
+const (
+	DefaultModel        = "claude-3-5-haiku-20241022"
+	DefaultMaxTokens    = 2000
+	DefaultTemperature  = 0.7
+	DefaultConfigPath   = "config.json"
+	AnthropicBaseURL    = "https://api.anthropic.com/v1"
+	APIKeyEnvVar        = "ANTHROPIC_API_KEY"
+	RequestTimeout      = 60 * time.Second
+	PreviewCardLimit    = 5
+)
+
+// File extensions
+const (
+	ExtPDF      = ".pdf"
+	ExtDOCX     = ".docx"
+	ExtMD       = ".md"
+	ExtMarkdown = ".markdown"
+	ExtCSV      = ".csv"
+	ExtTXT      = ".txt"
+	ExtTSV      = ".tsv"
+)
+
+// Default system prompt for flashcard generation
+const DefaultSystemPrompt = `You are an expert educator creating Anki flashcards. 
+Follow these principles:
+1. Create atomic cards (one concept per card)
+2. Make questions clear and unambiguous
+3. Keep answers concise but complete
+4. Focus on key concepts, definitions, formulas, and relationships
+5. Use active recall principles
+
+CRITICAL: Respond ONLY with a valid JSON array. Do not include any explanatory text, introductions, or conclusions. 
+Output format: JSON array of objects with "front" (question) and "back" (answer) fields.
+Generate comprehensive flashcards covering all important information.`
+
+// Logger provides simple structured logging
+type Logger struct {
+	verbose bool
+}
+
+// NewLogger creates a new logger instance
+func NewLogger(verbose bool) *Logger {
+	return &Logger{verbose: verbose}
+}
+
+// Info logs an informational message
+func (l *Logger) Info(msg string, args ...interface{}) {
+	fmt.Printf("ℹ️  "+msg+"\n", args...)
+}
+
+// Success logs a success message
+func (l *Logger) Success(msg string, args ...interface{}) {
+	fmt.Printf("✅ "+msg+"\n", args...)
+}
+
+// Error logs an error message
+func (l *Logger) Error(msg string, args ...interface{}) {
+	fmt.Printf("❌ "+msg+"\n", args...)
+}
+
+// Debug logs a debug message if verbose mode is enabled
+func (l *Logger) Debug(msg string, args ...interface{}) {
+	if l.verbose {
+		fmt.Printf("🔍 "+msg+"\n", args...)
+	}
+}
+
+// Progress logs a progress message
+func (l *Logger) Progress(msg string, args ...interface{}) {
+	fmt.Printf("🤖 "+msg+"\n", args...)
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Config holds application configuration
 type Config struct {
 	APIKey       string  `json:"api_key"`
@@ -29,11 +110,49 @@ type Config struct {
 	SystemPrompt string  `json:"system_prompt"`
 }
 
+// NewDefaultConfig creates a new configuration with default values
+func NewDefaultConfig() Config {
+	return Config{
+		Model:        DefaultModel,
+		MaxTokens:    DefaultMaxTokens,
+		Temperature:  DefaultTemperature,
+		SystemPrompt: DefaultSystemPrompt,
+	}
+}
+
+// Validate checks if the configuration is valid
+func (c *Config) Validate() error {
+	if c.APIKey == "" {
+		return fmt.Errorf("API key is required")
+	}
+	if c.Model == "" {
+		return fmt.Errorf("model is required")
+	}
+	if c.MaxTokens <= 0 {
+		return fmt.Errorf("max tokens must be positive")
+	}
+	if c.Temperature < 0 || c.Temperature > 2 {
+		return fmt.Errorf("temperature must be between 0 and 2")
+	}
+	return nil
+}
+
 // Flashcard represents a single Anki flashcard
 type Flashcard struct {
 	Front string   `json:"front"`
 	Back  string   `json:"back"`
 	Tags  []string `json:"tags,omitempty"`
+}
+
+// Validate checks if the flashcard has required fields
+func (f *Flashcard) Validate() error {
+	if strings.TrimSpace(f.Front) == "" {
+		return fmt.Errorf("flashcard front cannot be empty")
+	}
+	if strings.TrimSpace(f.Back) == "" {
+		return fmt.Errorf("flashcard back cannot be empty")
+	}
+	return nil
 }
 
 // FileParser interface for different file types
@@ -104,26 +223,58 @@ func (m *MarkdownParser) Parse(filepath string) (string, error) {
 	return text, nil
 }
 
-// stripHTML removes HTML tags from text (simplified version)
+// stripHTML removes HTML tags from text and handles common HTML entities
 func stripHTML(html string) string {
-	// This is a simplified version. In production, use golang.org/x/net/html
 	var result strings.Builder
 	inTag := false
+	inEntity := false
+	entityBuffer := strings.Builder
 
 	for _, r := range html {
-		switch r {
-		case '<':
+		switch {
+		case r == '<':
 			inTag = true
-		case '>':
+		case r == '>' && inTag:
 			inTag = false
-		default:
-			if !inTag {
-				result.WriteRune(r)
+		case r == '&' && !inTag:
+			inEntity = true
+			entityBuffer.Reset()
+			entityBuffer.WriteRune(r)
+		case r == ';' && inEntity:
+			inEntity = false
+			entityBuffer.WriteRune(r)
+			entity := entityBuffer.String()
+			// Handle common HTML entities
+			switch entity {
+			case "&amp;":
+				result.WriteString("&")
+			case "&lt;":
+				result.WriteString("<")
+			case "&gt;":
+				result.WriteString(">")
+			case "&quot;":
+				result.WriteString("\"")
+			case "&apos;":
+				result.WriteString("'")
+			case "&nbsp;":
+				result.WriteString(" ")
+			default:
+				// For unknown entities, just add the text
+				result.WriteString(entity)
 			}
+		case inEntity:
+			entityBuffer.WriteRune(r)
+		case !inTag && !inEntity:
+			result.WriteRune(r)
 		}
 	}
 
-	return result.String()
+	// Clean up whitespace
+	text := result.String()
+	text = strings.ReplaceAll(text, "\n\n\n", "\n\n")
+	text = strings.TrimSpace(text)
+
+	return text
 }
 
 // extractJSON finds and extracts JSON array from Claude's response
@@ -164,7 +315,7 @@ type LLMClient struct {
 // NewLLMClient creates a new LLM client
 func NewLLMClient(config Config) *LLMClient {
 	clientConfig := openai.DefaultConfig(config.APIKey)
-	clientConfig.BaseURL = "https://api.anthropic.com/v1"
+	clientConfig.BaseURL = AnthropicBaseURL
 	client := openai.NewClientWithConfig(clientConfig)
 	return &LLMClient{
 		client: client,
@@ -176,17 +327,7 @@ func NewLLMClient(config Config) *LLMClient {
 func (l *LLMClient) GenerateFlashcards(content string, subject string) ([]Flashcard, error) {
 	systemPrompt := l.config.SystemPrompt
 	if systemPrompt == "" {
-		systemPrompt = `You are an expert educator creating Anki flashcards. 
-		Follow these principles:
-		1. Create atomic cards (one concept per card)
-		2. Make questions clear and unambiguous
-		3. Keep answers concise but complete
-		4. Focus on key concepts, definitions, formulas, and relationships
-		5. Use active recall principles
-		
-		CRITICAL: Respond ONLY with a valid JSON array. Do not include any explanatory text, introductions, or conclusions. 
-		Output format: JSON array of objects with "front" (question) and "back" (answer) fields.
-		Generate comprehensive flashcards covering all important information.`
+		systemPrompt = DefaultSystemPrompt
 	}
 
 	userPrompt := fmt.Sprintf(`Convert the following %s notes into Anki flashcards:
@@ -196,7 +337,7 @@ func (l *LLMClient) GenerateFlashcards(content string, subject string) ([]Flashc
 Create flashcards that cover all key concepts, ensuring each card tests a single piece of knowledge.
 Output as a JSON array.`, subject, content)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	defer cancel()
 
 	resp, err := l.client.CreateChatCompletion(
@@ -240,6 +381,17 @@ Output as a JSON array.`, subject, content)
 	err = json.Unmarshal([]byte(jsonContent), &flashcards)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse extracted JSON: %w\nExtracted JSON: %s", err, jsonContent)
+	}
+
+	// Validate flashcards
+	for i, card := range flashcards {
+		if err := card.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid flashcard at index %d: %w", i, err)
+		}
+	}
+
+	if len(flashcards) == 0 {
+		return nil, fmt.Errorf("no valid flashcards generated from content")
 	}
 
 	return flashcards, nil
@@ -309,13 +461,15 @@ type ProcessingPipeline struct {
 	parser   FileParser
 	llm      *LLMClient
 	exporter *AnkiExporter
+	logger   *Logger
 }
 
 // NewProcessingPipeline creates a new processing pipeline
-func NewProcessingPipeline(config Config) *ProcessingPipeline {
+func NewProcessingPipeline(config Config, verbose bool) *ProcessingPipeline {
 	return &ProcessingPipeline{
 		llm:      NewLLMClient(config),
 		exporter: &AnkiExporter{},
+		logger:   NewLogger(verbose),
 	}
 }
 
@@ -324,18 +478,18 @@ func (p *ProcessingPipeline) Process(inputPath, outputPath string, dryRun bool) 
 	// Determine file type and select parser
 	ext := strings.ToLower(filepath.Ext(inputPath))
 	switch ext {
-	case ".pdf":
+	case ExtPDF:
 		p.parser = &PDFParser{}
-	case ".docx":
+	case ExtDOCX:
 		p.parser = &DOCXParser{}
-	case ".md", ".markdown":
+	case ExtMD, ExtMarkdown:
 		p.parser = &MarkdownParser{}
 	default:
 		return fmt.Errorf("unsupported file format: %s", ext)
 	}
 
 	// Extract text content
-	fmt.Println("📖 Extracting text from file...")
+	p.logger.Info("Extracting text from file...")
 	content, err := p.parser.Parse(inputPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse file: %w", err)
@@ -345,19 +499,20 @@ func (p *ProcessingPipeline) Process(inputPath, outputPath string, dryRun bool) 
 		return fmt.Errorf("no text content found in file")
 	}
 
-	fmt.Printf("✅ Extracted %d characters of text\n", len(content))
+	p.logger.Success("Extracted %d characters of text", len(content))
+	p.logger.Debug("Content preview: %s", content[:min(200, len(content))])
 
 	// Determine subject from filename
 	subject := strings.TrimSuffix(filepath.Base(inputPath), ext)
 
 	// Generate flashcards using Claude AI
-	fmt.Println("🤖 Generating flashcards with Claude AI...")
+	p.logger.Progress("Generating flashcards with Claude AI...")
 	flashcards, err := p.llm.GenerateFlashcards(content, subject)
 	if err != nil {
 		return fmt.Errorf("failed to generate flashcards: %w", err)
 	}
 
-	fmt.Printf("✅ Generated %d flashcards\n", len(flashcards))
+	p.logger.Success("Generated %d flashcards", len(flashcards))
 
 	// Add subject as tag
 	for i := range flashcards {
@@ -366,9 +521,9 @@ func (p *ProcessingPipeline) Process(inputPath, outputPath string, dryRun bool) 
 
 	// Dry run mode - preview cards
 	if dryRun {
-		fmt.Println("\n🔍 Preview (first 5 cards):")
+		p.logger.Info("Preview (first %d cards):", PreviewCardLimit)
 		for i, card := range flashcards {
-			if i >= 5 {
+			if i >= PreviewCardLimit {
 				break
 			}
 			fmt.Printf("\nCard %d:\n", i+1)
@@ -379,12 +534,12 @@ func (p *ProcessingPipeline) Process(inputPath, outputPath string, dryRun bool) 
 	}
 
 	// Export to file
-	fmt.Println("💾 Saving flashcards...")
+	p.logger.Info("Saving flashcards...")
 	outputExt := strings.ToLower(filepath.Ext(outputPath))
 	switch outputExt {
-	case ".csv":
+	case ExtCSV:
 		err = p.exporter.ExportCSV(flashcards, outputPath)
-	case ".txt", ".tsv":
+	case ExtTXT, ExtTSV:
 		err = p.exporter.ExportTXT(flashcards, outputPath)
 	default:
 		// Default to TXT format
@@ -395,24 +550,20 @@ func (p *ProcessingPipeline) Process(inputPath, outputPath string, dryRun bool) 
 		return fmt.Errorf("failed to export flashcards: %w", err)
 	}
 
-	fmt.Printf("✅ Successfully saved %d flashcards to %s\n", len(flashcards), outputPath)
+	p.logger.Success("Successfully saved %d flashcards to %s", len(flashcards), outputPath)
 	return nil
 }
 
 // LoadConfig loads configuration from file or environment
 func LoadConfig(configPath string) (Config, error) {
-	config := Config{
-		Model:       "claude-3-5-haiku-20241022",
-		MaxTokens:   2000,
-		Temperature: 0.7,
-	}
+	config := NewDefaultConfig()
 
 	// Load .env file if it exists
 	_ = godotenv.Load()
 
 	// Try to load from config file (if no path specified, try config.json by default)
 	if configPath == "" {
-		configPath = "config.json"
+		configPath = DefaultConfigPath
 	}
 
 	data, err := os.ReadFile(configPath)
@@ -424,12 +575,12 @@ func LoadConfig(configPath string) (Config, error) {
 	}
 
 	// Override with environment variable if set
-	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+	if apiKey := os.Getenv(APIKeyEnvVar); apiKey != "" {
 		config.APIKey = apiKey
 	}
 
 	if config.APIKey == "" {
-		return config, fmt.Errorf("API key not found. Set ANTHROPIC_API_KEY environment variable or provide in config file")
+		return config, fmt.Errorf("API key not found. Set %s environment variable or provide in config file", APIKeyEnvVar)
 	}
 
 	return config, nil
@@ -440,11 +591,13 @@ func main() {
 	var (
 		configPath string
 		dryRun     bool
+		verbose    bool
 		help       bool
 	)
 
 	flag.StringVar(&configPath, "config", "", "Path to configuration file")
 	flag.BoolVar(&dryRun, "dry-run", false, "Preview flashcards without saving")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 	flag.BoolVar(&help, "help", false, "Show help message")
 	flag.Parse()
 
@@ -455,6 +608,7 @@ func main() {
 		fmt.Println("\nOptions:")
 		fmt.Println("  -config string   Path to configuration file")
 		fmt.Println("  -dry-run        Preview flashcards without saving")
+		fmt.Println("  -verbose        Enable verbose logging")
 		fmt.Println("  -help           Show this help message")
 		fmt.Println("\nSupported input formats: PDF, DOCX, MD")
 		fmt.Println("Supported output formats: TXT (tab-separated), CSV")
@@ -467,26 +621,38 @@ func main() {
 	inputPath := flag.Arg(0)
 	outputPath := flag.Arg(1)
 
+	// Create logger for main function
+	logger := NewLogger(verbose)
+	
 	// Validate input file exists
 	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-		log.Fatalf("❌ Error: Input file does not exist: %s", inputPath)
+		logger.Error("Input file does not exist: %s", inputPath)
+		os.Exit(1)
 	}
 
 	// Load configuration
 	config, err := LoadConfig(configPath)
 	if err != nil {
-		log.Fatalf("❌ Configuration error: %v", err)
+		logger.Error("Configuration error: %v", err)
+		os.Exit(1)
+	}
+	
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		logger.Error("Invalid configuration: %v", err)
+		os.Exit(1)
 	}
 
 	// Create and run pipeline
-	pipeline := NewProcessingPipeline(config)
+	pipeline := NewProcessingPipeline(config, verbose)
 
 	startTime := time.Now()
 	err = pipeline.Process(inputPath, outputPath, dryRun)
 	if err != nil {
-		log.Fatalf("❌ Processing failed: %v", err)
+		logger.Error("Processing failed: %v", err)
+		os.Exit(1)
 	}
 
 	duration := time.Since(startTime)
-	fmt.Printf("⏱️  Completed in %.2f seconds\n", duration.Seconds())
+	logger.Info("⏱️  Completed in %.2f seconds", duration.Seconds())
 }
