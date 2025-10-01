@@ -1,4 +1,4 @@
-# Note2Anki - Study Notes to Anki Flashcards Converter
+# (INSTANCE) Note2Anki - Study Notes to Anki Flashcards Converter
 
 A powerful CLI tool that converts your study notes (PDF, DOCX, Markdown) into Anki-compatible flashcards using Claude AI.
 
